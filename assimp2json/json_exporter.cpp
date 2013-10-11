@@ -14,8 +14,15 @@ Licensed under a 3-clause BSD license. See the LICENSE file for more information
 #include <assimp/scene.h>
 
 #include <sstream>
-#include <boost/scoped_ptr.hpp>
 #include <limits>
+#include <cassert>
+
+
+// grab scoped_ptr from assimp to avoid a dependency on boost. 
+#include <assimp/../../code/BoostWorkaround/boost/scoped_ptr.hpp>
+
+#include "mesh_splitter.h"
+
 
 extern "C" {
 #include "cencode.h"
@@ -89,12 +96,12 @@ public:
 		AddIndentation();
 		Delimit();
 
-		buff << LiteralToString(name) << '\n';
+		LiteralToString(buff, name) << '\n';
 	}
 
 	template<typename Literal>
 	void SimpleValue(const Literal& s) {
-		buff << LiteralToString(s) << '\n';
+		LiteralToString(buff, s) << '\n';
 	}
 
 
@@ -102,13 +109,22 @@ public:
 		base64_encodestate s;
 		base64_init_encodestate(&s);
 
-		char* out = new char[std::max(len*2, static_cast<size_t>(16u))];
+		char* const out = new char[std::max(len*2, static_cast<size_t>(16u))];
 		const int n = base64_encode_block(reinterpret_cast<const char*>( buffer ), static_cast<int>( len ),out,&s);
 		out[n+base64_encode_blockend(out + n,&s)] = '\0';
 
+		// base64 encoding may add newlines, but JSON strings may not contain 'real' newlines
+		// (only escaped ones). Remove any newlines in out.
+		for(char* cur = out; *cur; ++cur) {
+			if(*cur == '\n') {
+				*cur = ' ';
+			}
+		}
+
+
 		buff << '\"' << out << "\"\n";
 		delete[] out;
-	}
+	} 
 
 	void StartObj(bool is_element = false) {
 		// if this appears as a plain array element, we need to insert a delimiter and we should also indent it
@@ -126,6 +142,7 @@ public:
 	void EndObj() {
 		PopIndent();
 		AddIndentation();
+		first = false;
 		buff << "}\n";
 	}
 
@@ -167,15 +184,12 @@ public:
 private:
 
 	template<typename Literal>
-	std::string LiteralToString(const Literal& s) {
-		std::stringstream tmp;
-		tmp.imbue( std::locale("C") );
-
-		tmp << s;
-		return tmp.str();
+	std::stringstream& LiteralToString(std::stringstream& stream, const Literal& s) {
+		stream << s;
+		return stream;
 	}
 
-	std::string LiteralToString(const aiString& s) {
+	std::stringstream& LiteralToString(std::stringstream& stream, const aiString& s) {
 		std::string t;
 
 		// escape backslashes and single quotes, both would render the JSON invalid if left as is
@@ -188,18 +202,18 @@ private:
 
 			t.push_back(s.data[i]);
 		}
-		return "\"" + t + "\"";
+		stream << "\"";
+		stream << t;
+		stream << "\"";
+		return stream;
 	}
 
-	std::string LiteralToString(float f) {
-		std::stringstream tmp;
-		tmp.imbue( std::locale("C") );
-
+	std::stringstream& LiteralToString(std::stringstream& stream, float f) {
 		if (!std::numeric_limits<float>::is_iec559) {
 			// on a non IEEE-754 platform, we make no assumptions about the representation or existence
 			// of special floating-point numbers. 
-			tmp << f;
-			return tmp.str();
+			stream << f;
+			return stream;
 		}
 
 		// JSON does not support writing Inf/Nan
@@ -208,24 +222,28 @@ private:
 		// Nevertheless, many parsers will accept the special keywords Infinity, -Infinity and NaN
 		if (std::numeric_limits<float>::infinity() == fabs(f)) {
 			if (flags & Flag_WriteSpecialFloats) {
-				return (f < 0 ? "\"-" : "\"") + std::string( "Infinity\"" );
+				stream << (f < 0 ? "\"-" : "\"") + std::string( "Infinity\"" );
+				return stream;
 			}
 		//  we should print this warning, but we can't - this is called from within a generic assimp exporter, we cannot use cerr
 		//	std::cerr << "warning: cannot represent infinite number literal, substituting 0 instead (use -i flag to enforce Infinity/NaN)" << std::endl;
-			return "0.0";
+			stream << "0.0";
+			return stream;
 		}
 		// f!=f is the most reliable test for NaNs that I know of
 		else if (f != f) {
 			if (flags & Flag_WriteSpecialFloats) {
-				return "\"NaN\"";
+				stream << "\"NaN\"";
+				return stream;
 			}
 		//  we should print this warning, but we can't - this is called from within a generic assimp exporter, we cannot use cerr
 		//	std::cerr << "warning: cannot represent infinite number literal, substituting 0 instead (use -i flag to enforce Infinity/NaN)" << std::endl;
-			return "0.0";
+			stream << "0.0";
+			return stream;
 		}
 
-		tmp << f;
-		return tmp.str();
+		stream << f;
+		return stream;
 	}
 
 private: 
@@ -374,10 +392,12 @@ void Write(JSONWriter& out, const aiMesh& ai, bool is_elem = true)
 		out.Key("texturecoords");
 		out.StartArray();
 		for(unsigned int n = 0; n < ai.GetNumUVChannels(); ++n) {
+
+			const unsigned int numc = ai.mNumUVComponents[n] ? ai.mNumUVComponents[n] : 2;
 			
 			out.StartArray(true);
 			for(unsigned int i = 0; i < ai.mNumVertices; ++i) {
-				for(unsigned int c = 0; c < ai.mNumUVComponents[n]; ++c) {
+				for(unsigned int c = 0; c < numc; ++c) {
 					out.Element(ai.mTextureCoords[n][i][c]);
 				}
 			}
@@ -781,9 +801,9 @@ void Write(JSONWriter& out, const aiScene& ai)
 		}
 		out.EndArray();
 	}
-
 	out.EndObj();
 }
+
 
 void Assimp2Json(const char* file,Assimp::IOSystem* io,const aiScene* scene) 
 {
@@ -792,10 +812,26 @@ void Assimp2Json(const char* file,Assimp::IOSystem* io,const aiScene* scene)
 		//throw Assimp::DeadlyExportError("could not open output file");
 	}
 
-	// XXX Flag_WriteSpecialFloats is turned on by defaul, right now we don't have a configuration interface for exporters
-	JSONWriter s(*str,JSONWriter::Flag_WriteSpecialFloats);
-	Write(s,*scene);
+	// get a copy of the scene so we can modify it
+	aiScene* scenecopy_tmp;
+	aiCopyScene(scene, &scenecopy_tmp);
+
+	try {
+		// split meshes so they fit into a 16 bit index buffer
+		MeshSplitter splitter;
+		splitter.SetLimit(1 << 16);
+		splitter.Execute(scenecopy_tmp);
+
+		// XXX Flag_WriteSpecialFloats is turned on by default, right now we don't have a configuration interface for exporters
+		JSONWriter s(*str,JSONWriter::Flag_WriteSpecialFloats);
+		Write(s,*scenecopy_tmp);
+
+	}
+	catch(...) {
+		aiFreeScene(scenecopy_tmp);
+		throw;
+	}
+	aiFreeScene(scenecopy_tmp);
 }
 
-
-}
+} // 
